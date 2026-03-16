@@ -1,0 +1,677 @@
+const express = require('express');
+const path = require('path');
+const fs = require('fs').promises;
+const multer = require('multer');
+const ActiveDirectory = require('activedirectory2');
+const app = express();
+//const port = 3000;
+
+// ===== EMBEDDED LDAP CONFIGURATION =====
+// Hardcode your LDAP server details here - these will be hidden from users
+const LDAP_CONFIG = {
+    url: process.env.LDAP_URL,
+    baseDN: process.env.LDAP_BASE_DN,
+    username: process.env.LDAP_USERNAME,
+    password: process.env.LDAP_PASSWORD,
+};
+
+const port = process.env.PORT
+
+// Optional: Configure which groups are allowed to access the system
+const ALLOWED_GROUPS = [
+    'Domain Users',      // Basic access
+    'IT Admins',         // Administrative access
+];
+
+// Optional: Map roles based on group membership
+const ROLE_MAPPING = {
+    'IT Admins': 'admin',
+    'Domain Users': 'user'
+};
+// ======================================
+
+// Configure multer for file uploads
+const storage = multer.diskStorage({
+    destination: 'uploads/',
+    filename: (req, file, cb) => {
+        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+        cb(null, `script-${uniqueSuffix}.ps1`);
+    }
+});
+
+const upload = multer({ 
+    storage: storage,
+    limits: { fileSize: 10 * 1024 * 1024 },
+    fileFilter: (req, file, cb) => {
+        if (path.extname(file.originalname).toLowerCase() === '.ps1') {
+            cb(null, true);
+        } else {
+            cb(new Error('Only PowerShell script (.ps1) files are allowed'));
+        }
+    }
+});
+
+// Ensure directories exist
+const ensureDirectories = async () => {
+    try {
+        await fs.mkdir('uploads', { recursive: true });
+        await fs.mkdir('scripts', { recursive: true });
+    } catch (error) {
+        console.error('Error creating directories:', error);
+    }
+};
+ensureDirectories();
+
+// Serve static files
+app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.json());
+
+// Store uploaded scripts info
+const uploadedScripts = new Map();
+
+// Store user sessions
+const activeSessions = new Map();
+
+// Input validation middleware
+const validateScriptArgs = (req, res, next) => {
+    const { scriptArgs } = req.body;
+    
+    if (scriptArgs && !/^[a-zA-Z0-9\s\-_=,."\\:]+$/.test(scriptArgs)) {
+        return res.status(400).json({ error: 'Invalid characters in script arguments' });
+    }
+    
+    if (scriptArgs && scriptArgs.length > 500) {
+        return res.status(400).json({ error: 'Script arguments too long' });
+    }
+    
+    next();
+};
+
+// === LDAP AD AUTHENTICATION ENDPOINTS ===
+
+// Authenticate user against embedded LDAP configuration
+
+app.post('/api/ad/authenticate', async (req, res) => {
+    const { 
+        username,           // User's domain username
+        password            // User's domain password
+    } = req.body;
+
+    console.log('=== User Authentication Request ===');
+    console.log('Username:', username);
+    console.log('Using embedded LDAP server:', LDAP_CONFIG.url);
+    console.log('====================================');
+
+    if (!username || !password) {
+        return res.status(400).json({ 
+            success: false, 
+            error: 'Username and password are required' 
+        });
+    }
+
+    try {
+        // Format username - try different formats
+        let formattedUsername = username;
+        
+        // If username doesn't contain domain info, try different formats
+        if (!username.includes('@') && !username.includes('\\')) {
+            // Try UPN format (username@domain.com)
+            const domainParts = LDAP_CONFIG.baseDN.split(',')
+                .filter(part => part.trim().startsWith('dc='))
+                .map(part => part.trim().substring(3));
+            const domain = domainParts.join('.');
+            
+            // Try both formats
+            const upnFormat = `${username}@${domain}`;
+            const downLevelFormat = `${domain.split('.')[0]}\\${username}`;
+            
+            console.log('Trying username formats:', { upnFormat, downLevelFormat });
+            
+            // Try UPN format first (more common)
+            formattedUsername = upnFormat;
+        }
+
+        // Create AD config using embedded server details and user credentials
+        const config = {
+            url: LDAP_CONFIG.url,
+            baseDN: LDAP_CONFIG.baseDN,
+            username: formattedUsername,
+            password: password
+        };
+
+        console.log('Attempting authentication with:', {
+            url: config.url,
+            baseDN: config.baseDN,
+            username: config.username
+        });
+
+        // Create ActiveDirectory instance
+        const ad = new ActiveDirectory(config);
+
+        // Test authentication by finding the authenticated user
+        ad.findUser(formattedUsername, (err, user) => {
+            // Important: Check if headers already sent
+            if (res.headersSent) {
+                console.log('Headers already sent, skipping response');
+                return;
+            }
+
+            if (err) {
+                console.error('Authentication error details:', err);
+                
+                // Check for specific error types
+                let errorMessage = 'Authentication failed';
+                let errorDetails = err.message || '';
+                
+                // LDAP error code 52e = invalid credentials
+                if (errorDetails.includes('data 52e') || errorDetails.includes('Invalid credentials')) {
+                    errorMessage = 'Invalid username or password. Please check your credentials.';
+                } else if (errorDetails.includes('connect ECONNREFUSED')) {
+                    errorMessage = 'Cannot connect to LDAP server. Contact administrator.';
+                } else if (errorDetails.includes('timeout')) {
+                    errorMessage = 'Connection timeout. Server may be unreachable.';
+                } else if (err.code === 49) {
+                    errorMessage = 'Invalid username or password (LDAP error 49)';
+                }
+                
+                return res.json({
+                    success: false,
+                    error: errorMessage
+                });
+            }
+
+            if (!user) {
+                return res.json({
+                    success: false,
+                    error: 'User not found in Active Directory'
+                });
+            }
+
+            console.log('✅ User authenticated successfully:', user.displayName || user.cn);
+
+            // Get user's group memberships to determine role
+            const userGroups = user.memberOf || [];
+            let userRole = 'user';
+            let userPermissions = [];
+
+            // Determine role based on group membership
+            for (const group of userGroups) {
+                const groupName = extractGroupName(group);
+                if (ROLE_MAPPING[groupName]) {
+                    userRole = ROLE_MAPPING[groupName];
+                }
+                
+                if (ALLOWED_GROUPS.includes(groupName)) {
+                    userPermissions.push(groupName);
+                }
+            }
+
+            // Generate session token
+            const sessionToken = Date.now().toString(36) + Math.random().toString(36).substr(2);
+            
+            // Store session info
+            activeSessions.set(sessionToken, {
+                authenticatedAt: new Date(),
+                username: formattedUsername,
+                displayName: user.displayName || username,
+                email: user.mail,
+                sn: user.sn || user.SN || null,
+                dn: user.dn,
+                role: userRole,
+                permissions: userPermissions,
+                groups: userGroups.map(g => extractGroupName(g))
+            });
+
+            console.log(`✅ User ${username} authenticated successfully with role: ${userRole}`);
+
+            res.json({
+                success: true,
+                sessionToken: sessionToken,
+                user: {
+                    username: username,
+                    displayName: user.displayName || username,
+                    email: user.mail || null,
+                    sn: user.sn || user.SN || null,
+                    role: userRole,
+                    permissions: userPermissions
+                },
+                message: 'Authentication successful'
+            });
+        });
+
+    } catch (error) {
+        console.error('LDAP authentication error:', error);
+        
+        // Check if headers already sent
+        if (!res.headersSent) {
+            res.status(500).json({ 
+                success: false, 
+                error: 'Internal server error during authentication'
+            });
+        }
+    }
+});
+
+// Search AD group members with recursive option using LDAP_MATCHING_RULE_IN_CHAIN
+// Search AD group members - ALWAYS recursive (nested groups included)
+app.post('/api/ad/search-group-recursive', async (req, res) => {
+    const { 
+        sessionToken,
+        groupName,
+        attributes = 'displayName,mail,sn,title,telephoneNumber,pager,sAMAccountName',
+        page = 1,
+        pageSize = 200
+    } = req.body;
+
+    console.log('=== Group Search Request (Recursive) ===');
+    console.log('SessionToken:', sessionToken);
+    console.log('GroupName:', groupName);
+    console.log('Attributes:', attributes);
+    console.log('Page:', page);
+    console.log('PageSize:', pageSize);
+    console.log('=========================================');
+
+    if (!sessionToken) {
+        return res.status(401).json({ 
+            success: false, 
+            error: 'Not authenticated. Please login first.' 
+        });
+    }
+
+    if (!groupName) {
+        return res.status(400).json({ 
+            success: false, 
+            error: 'Group name is required' 
+        });
+    }
+
+    const session = activeSessions.get(sessionToken);
+    if (!session) {
+        return res.status(401).json({ 
+            success: false, 
+            error: 'Session expired or invalid. Please login again.' 
+        });
+    }
+
+    try {
+        const config = {
+            url: LDAP_CONFIG.url,
+            baseDN: LDAP_CONFIG.baseDN,
+            username: LDAP_CONFIG.username,
+            password: LDAP_CONFIG.password
+        };
+
+        const ad = new ActiveDirectory(config);
+
+        ad.findGroup(groupName, (err, group) => {
+            if (res.headersSent) return;
+            
+            if (err || !group) {
+                return res.json({ 
+                    success: false, 
+                    error: 'Group not found' 
+                });
+            }
+
+            const groupDN = group.dn;
+            
+            // ALWAYS use recursive filter
+            const recursiveFilter = `(memberOf:1.2.840.113556.1.4.1941:=${groupDN})`;
+            
+            console.log(`Using recursive filter: ${recursiveFilter}`);
+
+            const attrList = attributes.split(',').map(a => a.trim());
+            
+            const allAttributes = [
+                'dn', 'cn', 'name','sAMAccountName', 'sn', 'userPrincipalName',
+                'userAccountControl', 'displayName', 'mail', 
+                'title', 'telephoneNumber', 'pager',
+                'TelephoneNumber', 'PhoneNumber', 'homePhone', 'mobile',
+                'Pager', 'PagerNumber', 'SN',
+                ...attrList
+            ];
+
+            const searchOptions = {
+                filter: recursiveFilter,
+                attributes: [...new Set(allAttributes)],
+                scope: 'sub',
+                paged: {
+                    pageSize: 1000
+                }
+            };
+
+            ad.findUsers(searchOptions, (err, users) => {
+                if (res.headersSent) return;
+                
+                if (err) {
+                    console.error('Error in recursive search:', err);
+                    return res.json({ 
+                        success: false, 
+                        error: 'Search failed: ' + err.message 
+                    });
+                }
+
+                if (!users || users.length === 0) {
+                    return res.json({
+                        success: true,
+                        groupName: groupName,
+                        groupInfo: {
+                            dn: group.dn,
+                            cn: group.cn
+                        },
+                        totalUsers: 0,
+                        users: [],
+                        currentPage: page,
+                        pageSize: pageSize,
+                        totalPages: 0,
+                        message: 'No users found in this group'
+                    });
+                }
+
+                console.log(`✅ Found ${users.length} users recursively`);
+
+                const processedUsers = users.map(user => {
+                    const userData = {
+                        sAMAccountName: user.sAMAccountName || user.SAMAccountName || extractSAMFromDN(user.dn) || null,  // Make sAMAccountName first
+                        name: user.name || user.cn,
+                        dn: user.dn,
+                        sn: user.sn || user.SN || extractSnFromName(user.name) || null,
+                        userPrincipalName: user.userPrincipalName,
+                        displayName: user.displayName || user.DisplayName || null,
+                        mail: user.mail || user.Mail || user.email || null,
+                        title: user.title || user.Title || null,
+                        
+                        telephoneNumber: user.telephoneNumber || 
+                                       user.TelephoneNumber || 
+                                       user.phoneNumber || 
+                                       user.PhoneNumber || 
+                                       null,
+                        
+                        pager: user.pager || 
+                              user.Pager || 
+                              user.pagerNumber || 
+                              user.PagerNumber || 
+                              null
+                    };
+
+                    if (user.userAccountControl !== undefined) {
+                        userData.enabled = (user.userAccountControl & 2) !== 2;
+                    } else {
+                        userData.enabled = true;
+                    }
+
+                    return userData;
+                });
+
+                // Remove duplicates
+                const uniqueUsers = [];
+                const seenDNs = new Set();
+                
+                processedUsers.forEach(user => {
+                    if (!seenDNs.has(user.dn)) {
+                        seenDNs.add(user.dn);
+                        uniqueUsers.push(user);
+                    }
+                });
+
+                console.log(`After deduplication: ${uniqueUsers.length} unique users`);
+
+                // Calculate pagination
+                const totalUsers = uniqueUsers.length;
+                const totalPages = Math.ceil(totalUsers / pageSize);
+                const currentPage = Math.min(page, totalPages) || 1;
+                const startIndex = (currentPage - 1) * pageSize;
+                const endIndex = Math.min(startIndex + pageSize, totalUsers);
+                const paginatedUsers = uniqueUsers.slice(startIndex, endIndex);
+
+                // Count statistics
+                const withTelephone = uniqueUsers.filter(u => u.telephoneNumber).length;
+                const withPager = uniqueUsers.filter(u => u.pager).length;
+
+                res.json({
+                    success: true,
+                    domain: extractDomain(LDAP_CONFIG.url),
+                    groupName: groupName,
+                    groupInfo: {
+                        dn: group.dn,
+                        cn: group.cn
+                    },
+                    totalUsers: totalUsers,
+                    users: paginatedUsers,
+                    currentPage: currentPage,
+                    pageSize: pageSize,
+                    totalPages: totalPages,
+                    startIndex: startIndex + 1,
+                    endIndex: endIndex,
+                    attributes: ['sAMAccountName','name', 'sn', 'displayName', 'mail', 'title', 'telephoneNumber', 'pager', 'enabled'],
+                    recursive: true,
+                    stats: {
+                        withTelephone: withTelephone,
+                        withPager: withPager,
+                        duplicateCount: processedUsers.length - uniqueUsers.length
+                    }
+                });
+            });
+        });
+
+    } catch (error) {
+        console.error('Recursive search error:', error);
+        if (!res.headersSent) {
+            res.status(500).json({ 
+                success: false, 
+                error: error.message 
+            });
+        }
+    }
+});
+
+// Optional: Remove the non-recursive endpoint or keep it for backward compatibility
+// You can delete the /api/ad/search-group endpoint entirely if not needed
+
+// Get current user info
+app.get('/api/ad/user-info', (req, res) => {
+    const { sessionToken } = req.query;
+
+    if (!sessionToken) {
+        return res.status(401).json({ 
+            success: false, 
+            error: 'Not authenticated' 
+        });
+    }
+
+    const session = activeSessions.get(sessionToken);
+    if (!session) {
+        return res.status(401).json({ 
+            success: false, 
+            error: 'Session expired' 
+        });
+    }
+
+    res.json({
+        success: true,
+        user: {
+            username: session.username,
+            displayName: session.displayName,
+            email: session.email,
+            samAccountName: session.samAccountName,
+            role: session.role,
+            permissions: session.permissions,
+            groups: session.groups
+        }
+    });
+});
+
+// Logout
+app.post('/api/ad/logout', (req, res) => {
+    const { sessionToken } = req.body;
+    
+    if (sessionToken && activeSessions.has(sessionToken)) {
+        activeSessions.delete(sessionToken);
+        console.log(`Session ${sessionToken} terminated`);
+    }
+    
+    res.json({ success: true, message: 'Logged out successfully' });
+});
+
+// Helper function to extract domain from LDAP URL
+function extractDomain(ldapUrl) {
+    try {
+        const match = ldapUrl.match(/ldaps?:\/\/([^:\/]+)/);
+        if (match) {
+            return match[1];
+        }
+    } catch (e) {}
+    return 'Unknown Domain';
+}
+
+// Helper function to extract group name from DN
+function extractGroupName(groupDN) {
+    try {
+        const match = groupDN.match(/CN=([^,]+)/i);
+        return match ? match[1] : groupDN;
+    } catch (e) {
+        return groupDN;
+    }
+}
+
+// === SCRIPT UPLOAD ENDPOINTS (keep existing) ===
+
+app.post('/upload-script', upload.single('script'), async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ error: 'No script file uploaded' });
+        }
+
+        const scriptId = Date.now().toString();
+        const scriptPath = req.file.path;
+        const originalName = req.file.originalname;
+
+        uploadedScripts.set(scriptId, {
+            path: scriptPath,
+            originalName: originalName,
+            uploadedAt: new Date()
+        });
+
+        const content = await fs.readFile(scriptPath, 'utf8');
+        const preview = content.split('\n').slice(0, 10).join('\n');
+
+        res.json({
+            success: true,
+            scriptId: scriptId,
+            filename: originalName,
+            preview: preview,
+            message: 'Script uploaded successfully'
+        });
+
+    } catch (error) {
+        console.error('Upload error:', error);
+        res.status(500).json({ error: 'Failed to upload script' });
+    }
+});
+
+app.get('/scripts', (req, res) => {
+    const scripts = Array.from(uploadedScripts.entries()).map(([id, info]) => ({
+        id: id,
+        filename: info.originalName,
+        uploadedAt: info.uploadedAt
+    }));
+    res.json(scripts);
+});
+
+app.delete('/script/:id', async (req, res) => {
+    const scriptId = req.params.id;
+    const scriptInfo = uploadedScripts.get(scriptId);
+
+    if (!scriptInfo) {
+        return res.status(404).json({ error: 'Script not found' });
+    }
+
+    try {
+        await fs.unlink(scriptInfo.path);
+        uploadedScripts.delete(scriptId);
+        res.json({ success: true, message: 'Script deleted' });
+    } catch (error) {
+        console.error('Delete error:', error);
+        res.status(500).json({ error: 'Failed to delete script' });
+    }
+});
+
+app.post('/run-script', validateScriptArgs, async (req, res) => {
+    const { scriptArgs = '', scriptId } = req.body;
+
+    let scriptPath;
+    
+    if (scriptId && uploadedScripts.has(scriptId)) {
+        const scriptInfo = uploadedScripts.get(scriptId);
+        scriptPath = scriptInfo.path;
+    } else {
+        scriptPath = path.join(__dirname, 'scripts', 'sample-ad-query.ps1');
+    }
+
+    try {
+        await fs.access(scriptPath);
+    } catch {
+        return res.status(404).json({ 
+            success: false, 
+            error: 'Script not found. Please upload a script first.' 
+        });
+    }
+
+    const args = scriptArgs ? scriptArgs.split(' ') : [];
+    const ps = require('child_process').spawn('powershell.exe', [
+        '-ExecutionPolicy', 'Bypass',
+        '-File', scriptPath,
+        ...args
+    ]);
+
+    let stdout = '';
+    let stderr = '';
+
+    ps.stdout.on('data', (data) => {
+        stdout += data.toString();
+    });
+
+    ps.stderr.on('data', (data) => {
+        stderr += data.toString();
+    });
+
+    ps.on('close', (code) => {
+        if (code !== 0) {
+            return res.json({ 
+                success: false,
+                error: stderr || `Process exited with code ${code}`,
+                output: stdout
+            });
+        }
+        
+        res.json({ 
+            success: true,
+            output: stdout
+        });
+    });
+});
+
+// Cleanup old uploaded files (every hour)
+setInterval(async () => {
+    const oneHourAgo = Date.now() - (60 * 60 * 1000);
+    for (const [id, info] of uploadedScripts.entries()) {
+        if (info.uploadedAt < oneHourAgo) {
+            try {
+                await fs.unlink(info.path);
+                uploadedScripts.delete(id);
+                console.log(`Cleaned up old script: ${info.originalName}`);
+            } catch (error) {
+                console.error('Cleanup error:', error);
+            }
+        }
+    }
+}, 60 * 60 * 1000);
+
+app.listen(port, () => {
+    console.log(`Server listening at http://localhost:${port}`);
+    console.log(`🔍 AD Search Page: http://localhost:${port}/ad-search.html`);
+    console.log('\n🔒 LDAP Configuration (embedded):');
+    console.log(`   URL: ${LDAP_CONFIG.url}`);
+    console.log(`   BaseDN: ${LDAP_CONFIG.baseDN}`);
+    console.log(`   Service Account: ${LDAP_CONFIG.username}`);
+});

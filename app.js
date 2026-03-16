@@ -4,7 +4,7 @@ const fs = require('fs').promises;
 const multer = require('multer');
 const ActiveDirectory = require('activedirectory2');
 const app = express();
-//const port = 3000;
+//nst port = 3000;
 
 // ===== EMBEDDED LDAP CONFIGURATION =====
 // Hardcode your LDAP server details here - these will be hidden from users
@@ -14,6 +14,10 @@ const LDAP_CONFIG = {
     username: process.env.LDAP_USERNAME,
     password: process.env.LDAP_PASSWORD,
 };
+
+if (!process.env.LDAP_URL || !process.env.LDAP_BASE_DN || !process.env.LDAP_USERNAME || !process.env.LDAP_PASSWORD) {
+    console.warn('WARNING: LDAP configuration is missing one or more environment variables. Using placeholder defaults.');
+}
 
 const port = process.env.PORT
 
@@ -72,6 +76,26 @@ const uploadedScripts = new Map();
 // Store user sessions
 const activeSessions = new Map();
 
+// Optional: Disable login page / bypass authentication (for trusted environments)
+// By default, login is disabled (bypass mode). Set DISABLE_LOGIN=false to require authentication.
+const DISABLE_LOGIN = process.env.DISABLE_LOGIN !== 'false';
+const BYPASS_SESSION_TOKEN = 'bypass-login-session';
+
+if (DISABLE_LOGIN) {
+    const bypassUser = {
+        authenticatedAt: new Date(),
+        username: process.env.BYPASS_USERNAME || LDAP_CONFIG.username || 'bypass-user',
+        displayName: process.env.BYPASS_DISPLAY_NAME || 'Bypass User',
+        email: process.env.BYPASS_EMAIL || null,
+        sn: null,
+        dn: null,
+        role: 'admin',
+        permissions: ALLOWED_GROUPS.slice(),
+        groups: ALLOWED_GROUPS.slice()
+    };
+    activeSessions.set(BYPASS_SESSION_TOKEN, bypassUser);
+}
+
 // Input validation middleware
 const validateScriptArgs = (req, res, next) => {
     const { scriptArgs } = req.body;
@@ -101,6 +125,22 @@ app.post('/api/ad/authenticate', async (req, res) => {
     console.log('Username:', username);
     console.log('Using embedded LDAP server:', LDAP_CONFIG.url);
     console.log('====================================');
+
+    if (DISABLE_LOGIN) {
+        const bypassInfo = activeSessions.get(BYPASS_SESSION_TOKEN);
+        return res.json({
+            success: true,
+            sessionToken: BYPASS_SESSION_TOKEN,
+            user: {
+                username: bypassInfo.username,
+                displayName: bypassInfo.displayName,
+                email: bypassInfo.email,
+                role: bypassInfo.role,
+                permissions: bypassInfo.permissions
+            },
+            message: 'Login disabled (bypass mode enabled)'
+        });
+    }
 
     if (!username || !password) {
         return res.status(400).json({ 
@@ -271,7 +311,8 @@ app.post('/api/ad/search-group-recursive', async (req, res) => {
     console.log('PageSize:', pageSize);
     console.log('=========================================');
 
-    if (!sessionToken) {
+    const effectiveToken = sessionToken || (DISABLE_LOGIN ? BYPASS_SESSION_TOKEN : null);
+    if (!effectiveToken) {
         return res.status(401).json({ 
             success: false, 
             error: 'Not authenticated. Please login first.' 
@@ -285,7 +326,7 @@ app.post('/api/ad/search-group-recursive', async (req, res) => {
         });
     }
 
-    const session = activeSessions.get(sessionToken);
+    const session = activeSessions.get(effectiveToken);
     if (!session) {
         return res.status(401).json({ 
             success: false, 
@@ -472,14 +513,15 @@ app.post('/api/ad/search-group-recursive', async (req, res) => {
 app.get('/api/ad/user-info', (req, res) => {
     const { sessionToken } = req.query;
 
-    if (!sessionToken) {
+    const effectiveToken = sessionToken || (DISABLE_LOGIN ? BYPASS_SESSION_TOKEN : null);
+    if (!effectiveToken) {
         return res.status(401).json({ 
             success: false, 
             error: 'Not authenticated' 
         });
     }
 
-    const session = activeSessions.get(sessionToken);
+    const session = activeSessions.get(effectiveToken);
     if (!session) {
         return res.status(401).json({ 
             success: false, 

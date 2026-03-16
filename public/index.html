@@ -18,45 +18,14 @@
                 <i class="fas fa-network-wired"></i>
                 Active Directory Search
             </h1>
-            <p>Enter your domain credentials to access AD</p>
+            <p>Search Active Directory groups</p>
         </div>
         
         <div class="content">
-            <!-- Login Form -->
-            <div id="loginForm" class="login-container">
-                <div class="login-header">
-                    <i class="fas fa-user-circle"></i>
-                    <h2>Domain Login</h2>
-                    <p>Enter your domain username and password</p>
-                </div>
-                
-                <div class="login-field">
-                    <label><i class="fas fa-user"></i> Username</label>
-                    <input type="text" id="username" placeholder="e.g., johndoe or johndoe@bd.net">
-                </div>
-                
-                <div class="login-field">
-                    <label><i class="fas fa-lock"></i> Password</label>
-                    <input type="password" id="password" placeholder="Enter your domain password">
-                </div>
-                
-                <button class="login-btn" id="loginBtn">
-                    <i class="fas fa-sign-in-alt"></i> Login
-                </button>
-                
-                <div class="login-info" id="loginInfo">
-                    <i class="fas fa-info-circle"></i>
-                    <span id="loginMessage"></span>
-                </div>
-            </div>
-            
-            <!-- Main Content (hidden until login) -->
-            <div id="mainContent" class="main-content">
+            <div id="mainContent" class="main-content" style="display: block;">
                 <div class="user-info-bar" id="userInfoBar">
                     <span><i class="fas fa-user"></i> <span id="displayName"></span> (<span id="userRole"></span>)</span>
-                    <button class="logout-btn" id="logoutBtn">
-                        <i class="fas fa-sign-out-alt"></i> Logout
-                    </button>
+                   
                 </div>
                 
                 <div class="status-fashion" id="status"></div>
@@ -158,13 +127,7 @@
         });
 
         // DOM elements
-        const loginForm = document.getElementById('loginForm');
         const mainContent = document.getElementById('mainContent');
-        const username = document.getElementById('username');
-        const password = document.getElementById('password');
-        const loginBtn = document.getElementById('loginBtn');
-        const loginInfo = document.getElementById('loginInfo');
-        const loginMessage = document.getElementById('loginMessage');
         const displayName = document.getElementById('displayName');
         const userRole = document.getElementById('userRole');
         const logoutBtn = document.getElementById('logoutBtn');
@@ -191,96 +154,19 @@
         let currentAttributes = '';
         let sessionToken = null;
         let currentResults = null;
-        
-        // Check for saved session
-        const savedToken = sessionStorage.getItem('adSessionToken');
-        if (savedToken) {
-            validateSession(savedToken);
-        }
-        
-        // Login
-        loginBtn.addEventListener('click', async () => {
-            if (!username.value.trim() || !password.value.trim()) {
-                showLoginMessage('Please enter username and password', 'error');
-                return;
-            }
-            
-            loginBtn.disabled = true;
-            loginBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Logging in...';
-            
-            try {
-                const response = await fetch('/api/ad/authenticate', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        username: username.value.trim(),
-                        password: password.value.trim()
-                    })
-                });
-                
-                const data = await response.json();
-                
-                if (data.success) {
-                    sessionToken = data.sessionToken;
-                    sessionStorage.setItem('adSessionToken', sessionToken);
-                    
-                    displayName.textContent = data.user.displayName || data.user.username;
-                    userRole.textContent = data.user.role || 'user';
-                    
-                    loginForm.style.display = 'none';
-                    mainContent.style.display = 'block';
-                    
-                    showStatus('✅ Login successful', 'success');
-                } else {
-                    showLoginMessage(data.error || 'Login failed', 'error');
-                }
-            } catch (error) {
-                showLoginMessage('Connection error', 'error');
-            } finally {
-                loginBtn.disabled = false;
-                loginBtn.innerHTML = '<i class="fas fa-sign-in-alt"></i> Login';
-            }
-        });
-        
-        // Validate session
-        async function validateSession(token) {
-            try {
-                const response = await fetch(`/api/ad/user-info?sessionToken=${token}`);
-                const data = await response.json();
-                
-                if (data.success) {
-                    sessionToken = token;
-                    displayName.textContent = data.user.displayName || data.user.username;
-                    userRole.textContent = data.user.role || 'user';
-                    
-                    loginForm.style.display = 'none';
-                    mainContent.style.display = 'block';
-                } else {
-                    sessionStorage.removeItem('adSessionToken');
-                }
-            } catch (error) {
-                sessionStorage.removeItem('adSessionToken');
-            }
-        }
-        
-        // Logout
-        logoutBtn.addEventListener('click', async () => {
-            if (sessionToken) {
-                await fetch('/api/ad/logout', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ sessionToken })
-                });
-            }
-            
-            sessionToken = null;
-            sessionStorage.removeItem('adSessionToken');
-            loginForm.style.display = 'block';
-            mainContent.style.display = 'none';
-            username.value = '';
-            password.value = '';
-        });
-        
+
+        // Bypass login: always use a fixed session token and show search UI.
+        const BYPASS_SESSION_TOKEN = 'bypass-login-session';
+        const BYPASS_DISPLAY_NAME = 'User';
+        const BYPASS_ROLE = 'admin';
+
+        sessionToken = BYPASS_SESSION_TOKEN;
+        sessionStorage.setItem('adSessionToken', sessionToken);
+        displayName.textContent = BYPASS_DISPLAY_NAME;
+        userRole.textContent = BYPASS_ROLE;
+        mainContent.style.display = 'block';
+
+         
         // Search group
         searchBtn.addEventListener('click', async () => {
         if (!groupName.value.trim()) {
@@ -641,12 +527,6 @@ document.addEventListener('mouseover', function(e) {
         });
         
         // Helper functions
-        function showLoginMessage(msg, type) {
-            loginInfo.style.display = 'block';
-            loginMessage.textContent = msg;
-            loginInfo.className = 'login-info ' + type;
-        }
-        
         function showStatus(msg, type) {
             status.textContent = msg;
             status.className = 'status-fashion ' + type;
@@ -657,10 +537,6 @@ document.addEventListener('mouseover', function(e) {
         }
         
         // Enter key
-        password.addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') loginBtn.click();
-        });
-        
         groupName.addEventListener('keypress', (e) => {
             if (e.key === 'Enter') searchBtn.click();
         });
