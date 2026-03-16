@@ -21,18 +21,6 @@ if (!process.env.LDAP_URL || !process.env.LDAP_BASE_DN || !process.env.LDAP_USER
 
 const port = process.env.PORT
 
-// Optional: Configure which groups are allowed to access the system
-const ALLOWED_GROUPS = [
-    'Domain Users',      // Basic access
-    'IT Admins',         // Administrative access
-];
-
-// Optional: Map roles based on group membership
-const ROLE_MAPPING = {
-    'IT Admins': 'admin',
-    'Domain Users': 'user'
-};
-// ======================================
 
 // Configure multer for file uploads
 const storage = multer.diskStorage({
