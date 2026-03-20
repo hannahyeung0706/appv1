@@ -19,7 +19,7 @@ if (!process.env.LDAP_URL || !process.env.LDAP_BASE_DN || !process.env.LDAP_USER
     console.warn('WARNING: LDAP configuration is missing one or more environment variables. Using placeholder defaults.');
 }
 
-const port = process.env.PORT
+const port = process.env.PORT;
 
 
 // Configure multer for file uploads
