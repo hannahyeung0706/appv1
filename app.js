@@ -14,11 +14,7 @@ const LDAP_CONFIG = {
     username: process.env.LDAP_USERNAME,
     password: process.env.LDAP_PASSWORD,
 };
-
-const ALLOWED_GROUPS = process.env.ALLOWED_GROUPS;
-? process.env.ALLOWED_GROUPS.split(',').map(g => g.trim())
-    : [];
-                        
+                      
 if (!process.env.LDAP_URL || !process.env.LDAP_BASE_DN || !process.env.LDAP_USERNAME || !process.env.LDAP_PASSWORD) {
     console.warn('WARNING: LDAP configuration is missing one or more environment variables. Using placeholder defaults.');
 }
@@ -82,8 +78,6 @@ if (DISABLE_LOGIN) {
         sn: null,
         dn: null,
         role: 'admin',
-        permissions: ALLOWED_GROUPS.slice(),
-        groups: ALLOWED_GROUPS.slice()
     };
     activeSessions.set(BYPASS_SESSION_TOKEN, bypassUser);
 }
@@ -231,10 +225,6 @@ app.post('/api/ad/authenticate', async (req, res) => {
                 const groupName = extractGroupName(group);
                 if (ROLE_MAPPING[groupName]) {
                     userRole = ROLE_MAPPING[groupName];
-                }
-                
-                if (ALLOWED_GROUPS.includes(groupName)) {
-                    userPermissions.push(groupName);
                 }
             }
 
