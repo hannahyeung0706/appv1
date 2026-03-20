@@ -692,9 +692,6 @@ setInterval(async () => {
 }, 60 * 60 * 1000);
 
 app.listen(port, () => {
-    console.log(`Server listening at http://localhost:${port}`);
-    console.log(`🔍 AD Search Page: http://localhost:${port}/ad-search.html`);
-    console.log('\n🔒 LDAP Configuration (embedded):');
     console.log(`   URL: ${LDAP_CONFIG.url}`);
     console.log(`   BaseDN: ${LDAP_CONFIG.baseDN}`);
     console.log(`   Service Account: ${LDAP_CONFIG.username}`);
