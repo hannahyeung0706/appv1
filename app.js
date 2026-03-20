@@ -16,6 +16,8 @@ const LDAP_CONFIG = {
 };
 
 const ALLOWED_GROUPS = process.env.ALLOWED_GROUPS;
+? process.env.ALLOWED_GROUPS.split(',').map(g => g.trim())
+    : [];
                         
 if (!process.env.LDAP_URL || !process.env.LDAP_BASE_DN || !process.env.LDAP_USERNAME || !process.env.LDAP_PASSWORD) {
     console.warn('WARNING: LDAP configuration is missing one or more environment variables. Using placeholder defaults.');
